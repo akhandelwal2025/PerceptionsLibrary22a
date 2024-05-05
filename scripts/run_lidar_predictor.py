@@ -20,8 +20,8 @@ def main():
     profiler = cProfile.Profile()
 
     #import pdb; pdb.set_trace();
- 
-    for i in range(44, len(dl)):
+    ground_removal_time_sum = 0
+    for i in range(len(dl)):
         print(i)
         # load the i-th image from track testing run
         # profiler.enable()
@@ -29,13 +29,12 @@ def main():
         # profiler.disable()
         # profiler.print_stats()
         start = time.time()
-        cones, profiler = lp.profile_predict(dl[i])
+        ground_removal_time, profiler = lp.profile_predict(dl[i])
+        ground_removal_time_sum += ground_removal_time
         end = time.time()
-        print(f"Predict Time Elapsed: {end-start}")
         # profiler.print_stats()
-        print(cones)
-        lp.display()
-
+        # lp.display()
+    print(f"AVG GROUND REMOVE: {ground_removal_time_sum / len(dl)}")
 
     # start = time.time()
     # cones, profiler = lp.profile_predict(dl[750])

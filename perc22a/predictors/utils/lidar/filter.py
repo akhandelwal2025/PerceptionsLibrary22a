@@ -4,8 +4,31 @@ import numpy as np
 import open3d as o3d
 from skspatial.objects import Plane
 import time
+import collections
+import matplotlib.pyplot as plt
 import perc22a.predictors.utils.lidar.visualization as vis
 
+THRESHOLD = 0.0005 # Percent of total points allowed in a grid cell
+
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+class GridCell:
+    def __init__(self, top_left_x, top_left_y, bottom_right_x, bottom_right_y):
+        self.top_left = Point(top_left_x, top_left_y)
+        self.bottom_right = Point(bottom_right_x, bottom_right_y)
+
+    def __str__(self):
+        return f'{(self.top_left.x, self.top_left.y)} -> {(self.bottom_right.x, self.bottom_right.y)} | WIDTH: {self.get_width()} | HEIGHT: {self.get_height()}'
+
+    def get_width(self):
+        return abs(self.bottom_right.y - self.top_left.y)
+
+    def get_height(self):
+        return abs(self.bottom_right.x - self.top_left.x)
+  
 def trim_cloud(points, return_mask=False):
     """
     Trims a cloud of points to reduce to a point cloud of only cone points
@@ -65,37 +88,87 @@ def trim_cloud(points, return_mask=False):
     else:
         return points[mask]
 
+def points_in_cell(points, grid_cell):
+    mask_x = np.logical_and(points[:, 0] < grid_cell.bottom_right.x, grid_cell.top_left.x < points[:, 0])
+    mask_y = np.logical_and(points[:, 1] < grid_cell.bottom_right.y, grid_cell.top_left.y < points[:, 1])
+    mask = np.logical_and(mask_x, mask_y)
+    box = points[mask]
+    return box
 
 def remove_ground(
-    points, boxdim=0.5, height_threshold=0.01, xmin=-100, xmax=100, ymin=-100, ymax=100
+    points, boxdim=0.5, height_threshold=0.01, xmin=-100, xmax=100, ymin=-100, ymax=100, debug=True
 ):
     all_points = points
     points = box_range(points, xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)
-
+    
     xmax, ymax = points[:, :2].max(axis=0)
     xmin, ymin = points[:, :2].min(axis=0)
     # print(xmax, ymax, xmin, ymin)
     LPR = []
-    grid_points = []
+    grid_cells = []
+    subdivide_count = 0
 
     # iterate over all cells in the 2D grid overlayed on the x and y dimensions
     for i in range(int((xmax - xmin) // boxdim)):
         for j in range(int((ymax - ymin) // boxdim)):
-            # find all points within the grid cell
+            
+            # get boundaries for cell
             bxmin, bxmax = xmin + i * boxdim, xmin + (i + 1) * boxdim
             bymin, bymax = ymin + j * boxdim, ymin + (j + 1) * boxdim
-            mask_x = np.logical_and(points[:, 0] < bxmax, bxmin < points[:, 0])
-            mask_y = np.logical_and(points[:, 1] < bymax, bymin < points[:, 1])
-            mask = np.logical_and(mask_x, mask_y)
-            box = points[mask]
+            parent_cell = GridCell(bxmin, bymin, bxmax, bymax)
 
-            grid_points.append(box)
+            # run bfs on this grid cell until you get to a point where every cell is less than THRESHOLD points
+            queue = collections.deque()
+            queue.append(parent_cell)
 
-            # find lowest point in cell if exists
-            if box.size != 0:
-                minrow = np.argmin(box[:, 2])
-                boxLP = box[minrow].tolist()
-                LPR.append(boxLP)
+            while len(queue) > 0:
+                grid_cell = queue.popleft()
+                box = points_in_cell(points, grid_cell)
+                if len(box) / len(points) < THRESHOLD:
+                    # find lowest point in cell if exists
+                    if box.size != 0:
+                        minrow = np.argmin(box[:, 2])
+                        boxLP = box[minrow].tolist()
+                        LPR.append(boxLP)
+                        grid_cells.append(grid_cell)
+                else:
+                    # subdivide into fourths
+                    subdivide_count += 1
+                    # print(len(box), len(box)/len(points))
+                    # print(f'SUBDIVIDE COUNT: {subdivide_count} | PERCENT_THRESHOLD: {len(box) / len(points)} | BOX: {bxmin, bymin} -> {bxmax, bymax} ')
+                    center_x = (grid_cell.top_left.x + grid_cell.bottom_right.x) / 2
+                    center_y = (grid_cell.top_left.y + grid_cell.bottom_right.y) / 2
+                    # print(center_x, center_y)
+                    top_left = GridCell(grid_cell.top_left.x, grid_cell.top_left.y, center_x, center_y)
+                    top_right = GridCell(center_x, grid_cell.top_left.y, grid_cell.bottom_right.x, center_y)
+                    bottom_left = GridCell(grid_cell.top_left.x, center_y, center_x, grid_cell.bottom_right.y)
+                    bottom_right = GridCell(center_x, center_y, grid_cell.bottom_right.x, grid_cell.bottom_right.y)
+                    cells = [top_left, top_right, bottom_left, bottom_right]
+                    
+                    queue.append(top_left)
+                    queue.append(top_right)
+                    queue.append(bottom_left)
+                    queue.append(bottom_right)
+
+    # graph gridcells
+    if debug:
+        fig, ax = plt.subplots()
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        for grid_cell in grid_cells:
+            square = plt.Rectangle((grid_cell.top_left.x, grid_cell.bottom_right.y), grid_cell.get_width(), grid_cell.get_height(), color='blue', fill=False)
+            ax.add_patch(square)
+        
+        plt.xlabel('X-axis')
+        plt.ylabel('Y-axis')
+        plt.title('Square')
+
+        # Show the plot
+        plt.grid(True)
+        plt.show()
+    
+    print(f'SUBDIVIDE COUNT: {subdivide_count}')
+    print(f'NUM POINTS: {len(LPR)}')
 
     if len(LPR) > 0:
         # fit lowest points to plane and use to classify ground points

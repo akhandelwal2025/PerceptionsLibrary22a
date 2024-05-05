@@ -1,5 +1,7 @@
 import math
-
+import queue
+import threading
+import multiprocessing
 import numpy as np
 import open3d as o3d
 from skspatial.objects import Plane
@@ -8,7 +10,7 @@ import collections
 import matplotlib.pyplot as plt
 import perc22a.predictors.utils.lidar.visualization as vis
 
-THRESHOLD = 0.0005 # Percent of total points allowed in a grid cell
+THRESHOLD = 0.001 # Percent of total points allowed in a grid cell
 
 class Point:
     def __init__(self, x, y):
@@ -95,7 +97,124 @@ def points_in_cell(points, grid_cell):
     box = points[mask]
     return box
 
-def remove_ground(
+# parallelize each box, if a box gets subdivided, then spawn new threads for each
+def remove_ground_parallel_2(
+    points, boxdim=0.5, height_threshold=0.01, xmin=-100, xmax=100, ymin=-100, ymax=100, debug=True, interleave=True
+):
+    pass
+
+ALL_POINTS = None
+def calc_lowest_point(grid_cells):
+    LPR = []
+    for grid_cell in grid_cells:
+        box = points_in_cell(ALL_POINTS, grid_cell)
+        minrow = np.argmin(box[:, 2])
+        boxLP = box[minrow].tolist()
+        LPR.append(boxLP)
+    return LPR
+
+# compute the bounding boxes, then parallelize by assigning subsection of boxes to a thread and finding lowest point
+def  remove_ground_parallel_1(
+    points, boxdim=0.5, height_threshold=0.01, xmin=-100, xmax=100, ymin=-100, ymax=100, debug=True, interleave=True, num_threads=2
+):
+    all_points = points
+    ALL_POINTS = points
+    points = box_range(points, xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)
+    
+    xmax, ymax = points[:, :2].max(axis=0)
+    xmin, ymin = points[:, :2].min(axis=0)
+    # print(xmax, ymax, xmin, ymin)
+    LPR = []
+    grid_cells = []
+    subdivide_count = 0
+    
+    # compute all grid-cells
+    for i in range(int((xmax - xmin) // boxdim)):
+        for j in range(int((ymax - ymin) // boxdim)):
+            
+            # get boundaries for cell
+            bxmin, bxmax = xmin + i * boxdim, xmin + (i + 1) * boxdim
+            bymin, bymax = ymin + j * boxdim, ymin + (j + 1) * boxdim
+            parent_cell = GridCell(bxmin, bymin, bxmax, bymax)
+
+            # run bfs on this grid cell until you get to a point where every cell is less than THRESHOLD points
+            queue = collections.deque()
+            queue.append(parent_cell)
+
+            while len(queue) > 0:
+                grid_cell = queue.popleft()
+                box = points_in_cell(points, grid_cell)
+                if len(box) / len(points) < THRESHOLD:
+                    # find lowest point in cell if exists
+                    if box.size != 0:
+                        grid_cells.append(grid_cell)
+                else:
+                    # subdivide into fourths
+                    subdivide_count += 1
+                    # print(len(box), len(box)/len(points))
+                    # print(f'SUBDIVIDE COUNT: {subdivide_count} | PERCENT_THRESHOLD: {len(box) / len(points)} | BOX: {bxmin, bymin} -> {bxmax, bymax} ')
+                    center_x = (grid_cell.top_left.x + grid_cell.bottom_right.x) / 2
+                    center_y = (grid_cell.top_left.y + grid_cell.bottom_right.y) / 2
+                    # print(center_x, center_y)
+                    top_left = GridCell(grid_cell.top_left.x, grid_cell.top_left.y, center_x, center_y)
+                    top_right = GridCell(center_x, grid_cell.top_left.y, grid_cell.bottom_right.x, center_y)
+                    bottom_left = GridCell(grid_cell.top_left.x, center_y, center_x, grid_cell.bottom_right.y)
+                    bottom_right = GridCell(center_x, center_y, grid_cell.bottom_right.x, grid_cell.bottom_right.y)
+                    
+                    queue.append(top_left)
+                    queue.append(top_right)
+                    queue.append(bottom_left)
+                    queue.append(bottom_right)
+    
+    # choose whether to use interleaving assignment or blocked
+    cell_assignments = [list() for _ in range(num_threads)]
+    if interleave:
+        i = 0
+        for grid_cell in grid_cells:
+            cell_assignments[i % num_threads].append(grid_cell)
+            i += 1
+    else:
+        num_elems_per_thread = len(grid_cells) / num_threads
+        cell_assignments = [grid_cells[i*num_elems_per_thread:(i+1)*num_elems_per_thread] for i in range(num_threads)]
+    
+    # parallelize computation of lowest points by splitting cells across threads
+    # result_queue = collections.deque()
+    # threads = []
+    # for i in range(num_threads):
+    #     thread = threading.Thread(target=calc_lowest_point, args=(points, cell_assignments[i], result_queue))
+    #     thread.start()
+    #     threads.append(thread)
+
+    # for thread in threads:
+    #     thread.join()
+    pool = multiprocessing.Pool(processes=num_threads)
+    LPR = pool.map(calc_lowest_point, cell_assignments)
+    # # Collect results from the queue
+    # LPR = list(result_queue)
+    
+    # compute ground plane
+    if len(LPR) > 0:
+        # fit lowest points to plane and use to classify ground points
+        # P, C = vis.color_matrix(fns=None, pcs=[points, np.array(LPR)])
+        # vis.update_visualizer_window(None, P, colors=C)
+
+        plane = Plane.best_fit(LPR)
+        A, B, C = tuple([val for val in plane.vector])
+        D = np.dot(plane.point, plane.vector)
+
+        dist_from_plane = (
+            A * all_points[:, 0] + B * all_points[:, 1] + C * all_points[:, 2] - D
+        )
+
+        # store ground plane vals here
+        pc_mask = height_threshold <= dist_from_plane
+    else:
+        pc_mask = np.ones(all_points.shape[0], dtype=np.uint8)
+        plane = None
+
+    return all_points[pc_mask], plane
+
+def remove_ground_sequential(
     points, boxdim=0.5, height_threshold=0.01, xmin=-100, xmax=100, ymin=-100, ymax=100, debug=True
 ):
     all_points = points

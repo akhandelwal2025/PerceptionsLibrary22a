@@ -98,9 +98,11 @@ class LidarPredictor(Predictor):
         if DEBUG_TIME: self.timer.end("\t\tfov-range")
         if DEBUG_TIME: self.timer.start("\t\tground-removal")
 
-        points_filtered_ground = filter.remove_ground(
+        points_filtered_ground = filter.remove_ground_parallel_1(
             points_ground_plane,
-            debug=False
+            debug=False,
+            interleave=True,
+            num_threads=8
         )
        
         if DEBUG_TIME: to_ret = self.timer.end("\t\tground-removal")

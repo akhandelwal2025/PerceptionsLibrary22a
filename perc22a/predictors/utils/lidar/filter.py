@@ -6,6 +6,8 @@ from skspatial.objects import Plane
 import time
 import perc22a.predictors.utils.lidar.visualization as vis
 
+import time
+
 def trim_cloud(points, return_mask=False):
     """
     Trims a cloud of points to reduce to a point cloud of only cone points
@@ -65,6 +67,109 @@ def trim_cloud(points, return_mask=False):
     else:
         return points[mask]
 
+import threading
+
+def thread_work(xmin, xmax, ymin, ymax, points, boxdim, results, index, overlap=0.1):
+    local_LPR = []
+    local_grid_points = []
+
+    # Expand range by overlap to prevent missing points at boundaries
+    if index > 0:
+        xmin -= overlap
+    if index < len(results) - 1:
+        xmax += overlap
+
+    for i in range(int((xmax - xmin) // boxdim)):
+        for j in range(int((ymax - ymin) // boxdim)):
+            bxmin, bxmax = xmin + i * boxdim, xmin + (i + 1) * boxdim
+            bymin, bymax = ymin + j * boxdim, ymin + (j + 1) * boxdim
+            mask_x = np.logical_and(points[:, 0] < bxmax, bxmin < points[:, 0])
+            mask_y = np.logical_and(points[:, 1] < bymax, bymin < points[:, 1])
+            mask = np.logical_and(mask_x, mask_y)
+            box = points[mask]
+
+            local_grid_points.append(box)
+
+            if box.size != 0:
+                minrow = np.argmin(box[:, 2])
+                boxLP = box[minrow].tolist()
+                local_LPR.append(boxLP)
+
+    results[index] = (local_grid_points, local_LPR)
+
+def remove_ground_THREADING(points, boxdim=0.5, height_threshold=0.01, xmin=-100, xmax=100, ymin=-100, ymax=100, num_threads=4):
+    all_points = points
+    points = box_range(points, xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)
+
+    xmax, ymax = points[:, :2].max(axis=0)
+    xmin, ymin = points[:, :2].min(axis=0)
+
+    threads = []
+    results = [None] * num_threads
+    # Calculate ranges for each thread
+    x_ranges = np.linspace(xmin, xmax, num_threads + 1)
+
+    # Start time measurement
+    start_time = time.time()
+
+    for i in range(num_threads):
+        txmin = x_ranges[i]
+        txmax = x_ranges[i + 1]
+        thread = threading.Thread(target=thread_work, args=(txmin, txmax, ymin, ymax, points, boxdim, results, i, boxdim/2))
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    LPR = []
+    for result in results:
+        LPR.extend(result[1])
+
+    # End time measurement
+    duration = time.time() - start_time
+
+    return duration, LPR
+
+from multiprocessing import Pool, freeze_support
+
+def process_grid_cell(args):
+    xmin, ymin, boxdim, i, j, points = args
+    bxmin, bxmax = xmin + i * boxdim, xmin + (i + 1) * boxdim
+    bymin, bymax = ymin + j * boxdim, ymin + (j + 1) * boxdim
+    mask_x = np.logical_and(points[:, 0] < bxmax, bxmin < points[:, 0])
+    mask_y = np.logical_and(points[:, 1] < bymax, bymin < points[:, 1])
+    mask = np.logical_and(mask_x, mask_y)
+    box = points[mask]
+    if box.size != 0:
+        minrow = np.argmin(box[:, 2])
+        boxLP = box[minrow].tolist()
+        return boxLP
+    return None
+
+def remove_ground_MULTIPROCESSING(
+    points, boxdim=0.5, height_threshold=0.01, xmin=-100, xmax=100, ymin=-100, ymax=100, num_processes=4
+):
+    points = box_range(points, xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)
+
+    xmax, ymax = points[:, :2].max(axis=0)
+    xmin, ymin = points[:, :2].min(axis=0)
+
+    grid_size_x = int((xmax - xmin) // boxdim)
+    grid_size_y = int((ymax - ymin) // boxdim)
+    
+    start_time = time.time()
+
+    args = [(xmin, ymin, boxdim, i, j, points) for i in range(grid_size_x) for j in range(grid_size_y)]
+    with Pool(processes=num_processes) as pool:
+        LPR = pool.map(process_grid_cell, args)
+    
+    # Filter out None values, which represent empty grid cells
+    LPR = [x for x in LPR if x is not None]
+
+    duration = time.time() - start_time
+    return duration, LPR
+    
 
 def remove_ground(
     points, boxdim=0.5, height_threshold=0.01, xmin=-100, xmax=100, ymin=-100, ymax=100
@@ -77,6 +182,9 @@ def remove_ground(
     # print(xmax, ymax, xmin, ymin)
     LPR = []
     grid_points = []
+
+    # start time measurement of for loop
+    start_time = time.time()
 
     # iterate over all cells in the 2D grid overlayed on the x and y dimensions
     for i in range(int((xmax - xmin) // boxdim)):
@@ -97,6 +205,10 @@ def remove_ground(
                 boxLP = box[minrow].tolist()
                 LPR.append(boxLP)
 
+    # end time measurement of for loop
+    duration = time.time() - start_time
+    return duration, LPR
+
     if len(LPR) > 0:
         # fit lowest points to plane and use to classify ground points
         # P, C = vis.color_matrix(fns=None, pcs=[points, np.array(LPR)])
@@ -116,6 +228,7 @@ def remove_ground(
         pc_mask = np.ones(all_points.shape[0], dtype=np.uint8)
         plane = None
 
+    return duration
     return all_points[pc_mask], plane
 
 # removing cupy import due to dependency issues -- requires Python 3.9/3.10
@@ -618,3 +731,24 @@ def voxel_downsample(points, voxel_size=0.1):
     points_downsampled = np.asarray(pcd_downsampled.points)
     return points_downsampled
 
+if __name__ == '__main__':
+    freeze_support()
+    N = 500000
+    np.random.seed(418)
+    points = np.random.rand(N, 3) * 100
+    print(f"Starting ground filtering for {N} points")
+
+    # sequential
+    sequential_duration, sequential_LPR = remove_ground(points)
+    print(f"Sequential time elapsed: {sequential_duration}")
+
+    # threading
+    threading_duration, threading_LPR = remove_ground_THREADING(points)
+    print(f"Threading time elapsed: {threading_duration}")
+
+    # multiprocessing
+    multiprocessing_duration, multiprocessing_LPR = remove_ground_MULTIPROCESSING(points)
+    print(f"Multiprocessing time elapsed: {multiprocessing_duration}")
+
+    # comparing outputs
+    # assert np.allclose(sequential_LPR, multiprocessing_LPR)
